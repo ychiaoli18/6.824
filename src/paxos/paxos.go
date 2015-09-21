@@ -20,6 +20,41 @@ package paxos
 // px.Min() int -- instances before this seq have been forgotten
 //
 
+/* 
+  Note: https://pdos.csail.mit.edu/6.824/labs/lab-3.html
+
+  Paxos Pseudo Code
+    proposer(v):
+      while not decided:
+        choose n, unique and higher than any n seen so far
+        send prepare(n) to all servers including self
+        if prepare_ok(n, n_a, v_a) from majority:
+          v' = v_a with highest n_a; choose own v otherwise
+          send accept(n, v') to all
+          if accept_ok(n) from majority:
+            send decided(v') to all
+    
+    acceptor's state:
+      n_p (highest prepare seen)
+      n_a, v_a (highest accept seen)
+    
+    acceptor's prepare(n) handler:
+      if n > n_p
+        n_p = n
+        reply prepare_ok(n, n_a, v_a)
+      else
+        reply prepare_reject
+    
+    acceptor's accept(n, v) handler:
+      if n >= n_p
+        n_p = n
+        n_a = n
+        v_a = v
+        reply accept_ok(n)
+      else
+        reply accept_reject
+*/
+
 import "net"
 import "net/rpc"
 import "log"
@@ -27,7 +62,15 @@ import "os"
 import "syscall"
 import "sync"
 import "fmt"
+import "time"
+import "strconv"
 import "math/rand"
+
+const (
+  EMPTY = "0"
+  OK = "OK"
+  REJECT = "REJECT"
+)
 
 
 type Paxos struct {
@@ -41,6 +84,222 @@ type Paxos struct {
 
 
   // Your data here.
+
+  instances map[int]*PaxosInstance
+  dones []int
+}
+
+type Proposal struct {
+  ballot string
+  val interface {}
+}
+
+type PaxosInstance struct {
+  pid int
+  val interface {}
+  decided bool
+  prepared_ballot string
+  accepted_proposal Proposal
+}
+
+type RPCArg struct {
+  Pid int
+  Ballot string
+  Val interface {}
+  Me int
+  Done int
+}
+
+type RPCReply struct {
+  Result string // enum(reject, ok)
+  Ballot string
+  Val interface {}
+}
+
+
+func (px *Paxos) generateBallot() string {
+  begin := time.Date(2014, time.May, 6, 23, 0, 0, 0, time.UTC)
+  duration := time.Now().Sub(begin)
+  return strconv.FormatInt(duration.Nanoseconds(), 10) + "-" + strconv.Itoa(px.me)
+}
+
+func (px *Paxos) sendPrepare (pid int, val interface {}) (bool, Proposal) {
+
+  ballot := px.generateBallot()
+  proposal := Proposal{ EMPTY, val }
+
+  nOk := 0
+  for i, acceptor := range px.peers {
+
+    arg := RPCArg{ Pid: pid, Ballot: ballot, Me: px.me }
+    reply := RPCReply{ Result: REJECT }
+    if (i == px.me) {
+      px.ProcessPrepare(&arg, &reply)
+    } else {
+      call(acceptor, "Paxos.ProcessPrepare", &arg, &reply)
+      if reply.Result == OK {
+        if reply.Ballot > proposal.ballot {
+          proposal.ballot = reply.Ballot
+          proposal.val = reply.Val
+        }
+        nOk++
+      }
+    }
+  }
+  return px.IsMajority(nOk), proposal
+}
+
+func (px *Paxos) sendAccept (pid int, proposal Proposal) bool {
+
+  nOk := 0
+  for i, acceptor := range px.peers {
+
+    arg := RPCArg{ Pid: pid, Ballot: proposal.ballot, Val: proposal.val, Me: px.me }
+    reply := RPCReply{ Result: REJECT }
+
+    if i == px.me {
+      px.ProcessAccept(&arg, &reply)
+    } else {
+      call(acceptor, "Paxos.ProcessAccept", &arg, &reply)
+      if reply.Result == OK {
+        nOk++
+      }
+    }
+  }
+  return px.IsMajority(nOk)
+}
+
+func (px *Paxos) sendDecision(pid int, proposal Proposal) {
+
+  arg := RPCArg{ Pid: pid, Ballot: proposal.ballot, Val: proposal.val, Done: px.dones[px.me], Me: px.me }
+  reply := RPCReply{}
+  px.makeDecision(pid, proposal)
+  for i, peer := range px.peers {
+    if i != px.me {
+      call(peer, "Paxos.ProcessDecision", &arg, &reply)
+    }
+  }
+
+}
+
+func (px *Paxos) makeDecision(pid int, proposal Proposal) {
+  if _, exist := px.instances[pid]; !exist {
+    px.instances[pid] = &PaxosInstance{
+      pid: pid,
+      val: nil,
+      decided: true,
+      prepared_ballot: EMPTY,
+      accepted_proposal: proposal}
+  } else {
+    px.instances[pid].decided = true
+    px.instances[pid].accepted_proposal = proposal
+  }
+}
+
+func (px *Paxos) ProcessDecision(arg *RPCArg, reply *RPCReply) error {
+  px.mu.Lock()
+  defer px.mu.Unlock()
+  px.makeDecision(arg.Pid, Proposal{ ballot: arg.Ballot, val: arg.Val })
+  return nil
+}
+
+func (px *Paxos) ProcessPrepare (arg *RPCArg, reply *RPCReply) error {
+// acceptor's state:
+//   n_p (highest prepare seen)
+//   n_a, v_a (highest accept seen)
+// 
+// acceptor's prepare(n) handler:
+//   if n > n_p
+//     n_p = n
+//     reply prepare_ok(n, n_a, v_a)
+//   else
+//     reply prepare_reject
+
+  px.mu.Lock()
+  defer px.mu.Unlock()
+
+  instance, exist := px.instances[arg.Pid]
+
+  if !exist {
+    reply.Result = OK
+    px.instances[arg.Pid] = &PaxosInstance{
+      pid: arg.Pid,
+      val: nil,
+      decided: false,
+      prepared_ballot: arg.Ballot,
+      accepted_proposal: Proposal{ballot: arg.Ballot}}
+
+  } else if arg.Ballot > instance.prepared_ballot {
+    reply.Result = OK
+    reply.Ballot = instance.accepted_proposal.ballot
+    reply.Val = instance.accepted_proposal.val
+    instance.prepared_ballot = arg.Ballot
+  }
+  return nil
+}
+
+func (px *Paxos) ProcessAccept (arg *RPCArg, reply *RPCReply) error {
+// acceptor's accept(n, v) handler:
+//   if n >= n_p
+//     n_p = n
+//     n_a = n
+//     v_a = v
+//     reply accept_ok(n)
+//   else
+//     reply accept_reject
+
+  px.mu.Lock()
+  defer px.mu.Unlock()
+
+  instance, exist := px.instances[arg.Pid]
+
+  if !exist {
+    reply.Result = OK
+    px.instances[arg.Pid] = &PaxosInstance{
+      pid: arg.Pid,
+      val: arg.Val,
+      decided: false,
+      prepared_ballot: arg.Ballot,
+      accepted_proposal: Proposal{ballot: arg.Ballot}}
+
+  } else if arg.Ballot >= instance.accepted_proposal.ballot {
+    reply.Result = OK
+    instance.prepared_ballot = arg.Ballot
+    instance.accepted_proposal = Proposal{ ballot: arg.Ballot, val: arg.Val }
+  }
+
+  return nil
+}
+
+func (px *Paxos) doPropose (pid int, val interface {}) {
+// proposer(v):
+//   while not decided:
+//     choose n, unique and higher than any n seen so far
+//     send prepare(n) to all servers including self
+//     if prepare_ok(n, n_a, v_a) from majority:
+//       v' = v_a with highest n_a; choose own v otherwise
+//       send accept(n, v') to all
+//       if accept_ok(n) from majority:
+//         send decided(v') to all
+  i := 1
+  for {
+    // proposal contains (n, v')
+    prepare_ok, proposal := px.sendPrepare(pid, val)
+
+    accept_ok := false
+    if prepare_ok {
+      accept_ok = px.sendAccept(pid, proposal)
+    }
+    if accept_ok {
+      px.sendDecision(pid, proposal)
+      break
+    }
+    i++
+  }
+}
+
+func (px *Paxos) IsMajority (nOk int) bool {
+  return nOk > len(px.peers) / 2
 }
 
 //
@@ -69,7 +328,7 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
     return false
   }
   defer c.Close()
-    
+
   err = c.Call(name, args, reply)
   if err == nil {
     return true
@@ -89,6 +348,15 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 //
 func (px *Paxos) Start(seq int, v interface{}) {
   // Your code here.
+
+  go func () {
+    if seq < px.Min() {
+      fmt.Println("returned...")
+      return
+    }
+    px.doPropose(seq, v)
+  } ()
+
 }
 
 //
@@ -108,7 +376,13 @@ func (px *Paxos) Done(seq int) {
 //
 func (px *Paxos) Max() int {
   // Your code here.
-  return 0
+  max := 0
+  for k, _ := range px.instances {
+    if k > max {
+      max = k
+    }
+  }
+  return max
 }
 
 //
@@ -141,7 +415,7 @@ func (px *Paxos) Max() int {
 // 
 func (px *Paxos) Min() int {
   // You code here.
-  return 0
+  return -1
 }
 
 //
@@ -153,6 +427,16 @@ func (px *Paxos) Min() int {
 //
 func (px *Paxos) Status(seq int) (bool, interface{}) {
   // Your code here.
+  min := px.Min()
+
+  if seq < min {
+    return false, nil
+  }
+
+  instance, exist := px.instances[seq]
+  if exist && instance.decided {
+    return true, instance.accepted_proposal.val
+  }
   return false, nil
 }
 
@@ -181,6 +465,11 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 
 
   // Your initialization code here.
+  px.instances = map[int]*PaxosInstance{}
+  px.dones = make([]int, len(peers))
+  for i:= range peers {
+    px.dones[i] = -1
+  }
 
   if rpcs != nil {
     // caller will create socket &c
@@ -197,10 +486,10 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
       log.Fatal("listen error: ", e);
     }
     px.l = l
-    
+
     // please do not change any of the following code,
     // or do anything to subvert it.
-    
+
     // create a thread to accept RPC connections
     go func() {
       for px.dead == false {
