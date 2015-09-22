@@ -223,7 +223,7 @@ func (px *Paxos) ProcessPrepare(arg *RPCArg, reply *RPCReply) error {
 			val:               nil,
 			decided:           false,
 			prepared_ballot:   arg.Ballot,
-			accepted_proposal: Proposal{ballot: arg.Ballot}}
+			accepted_proposal: Proposal{ballot: EMPTY}}
 	} else if arg.Ballot > instance.prepared_ballot {
 		reply.Result = OK
 	}
